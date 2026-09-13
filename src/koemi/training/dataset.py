@@ -26,8 +26,6 @@ class CausalByteDataset(Dataset[CausalChunk]):
         self.chunks = self.create_chunks(records, sequence_length)
         if not self.chunks:
             raise DatasetValidationError("dataset does not contain a trainable causal sequence")
-        if not any(target_id != IGNORE_TARGET_ID for chunk in self.chunks for target_id in chunk.target_ids):
-            raise DatasetValidationError("dataset does not contain supervised target tokens")
 
     def __len__(self) -> int:
         return len(self.chunks)
@@ -54,7 +52,8 @@ class CausalByteDataset(Dataset[CausalChunk]):
                     token_id if is_supervised else IGNORE_TARGET_ID
                     for token_id, is_supervised in zip(raw_target_ids, target_positions, strict=True)
                 )
-                chunks.append(CausalChunk(input_ids, target_ids, thinking_positions))
+                if any(target_id != IGNORE_TARGET_ID for target_id in target_ids):
+                    chunks.append(CausalChunk(input_ids, target_ids, thinking_positions))
         return tuple(chunks)
 
 

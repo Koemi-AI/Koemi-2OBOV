@@ -33,6 +33,10 @@ class TrainingResult:
     tokens_per_second: float
     final_learning_rate: float
     precision: str
+    mean_answer_loss: float | None = None
+    mean_answer_bpb: float | None = None
+    validation_answer_loss: float | None = None
+    validation_answer_bpb: float | None = None
 
 
 class Trainer:
@@ -61,16 +65,17 @@ class Trainer:
         scaler = torch.amp.GradScaler(device.type, enabled=device.type == "cuda" and precision == "fp16")
         accumulator = MetricAccumulator()
         optimizer_steps = 0
+        final_validation: MetricAccumulator | None = None
         start_time = time.perf_counter()
         optimizer.zero_grad(set_to_none=True)
         for epoch_index in range(1, settings.epochs + 1):
             epoch_metrics = MetricAccumulator()
             accumulated_batches = 0
             for batch_index, batch in enumerate(loader, start=1):
-                input_ids, target_ids, thinking_mask = self.move_batch(batch, device, settings.pin_memory)
-                supervised_count = int((target_ids != IGNORE_TARGET_ID).sum().item())
-                if supervised_count == 0:
+                supervised_token_count, thinking_token_count = self.count_supervision(batch)
+                if supervised_token_count == 0:
                     continue
+                input_ids, target_ids, thinking_mask = self.move_batch(batch, device, settings.pin_memory)
                 with self.autocast_context(device, autocast_dtype):
                     output = model(input_ids, execution_mode=execution_mode)
                     objective = calculate_training_objective(
@@ -79,6 +84,8 @@ class Trainer:
                         thinking_mask,
                         settings.thinking_loss_weight,
                         settings.label_smoothing,
+                        supervised_token_count=supervised_token_count,
+                        thinking_token_count=thinking_token_count,
                     )
                     scaled_loss = objective.total_loss / settings.gradient_accumulation_steps
                 scaler.scale(scaled_loss).backward()
@@ -87,7 +94,7 @@ class Trainer:
                     self.optimizer_step(model, optimizer, scheduler, scaler, settings, accumulated_batches)
                     optimizer_steps += 1
                     accumulated_batches = 0
-                epoch_metrics.add(output, objective, supervised_count)
+                epoch_metrics.add(output, objective, supervised_token_count, thinking_token_count)
             if accumulated_batches > 0:
                 self.optimizer_step(model, optimizer, scheduler, scaler, settings, accumulated_batches)
                 optimizer_steps += 1
@@ -98,17 +105,25 @@ class Trainer:
                 if validation_loader is not None
                 else None
             )
+            final_validation = validation
+            answer_loss = epoch_metrics.mean_answer_loss
+            validation_answer_loss = validation.mean_answer_loss if validation else None
             self.logger.info(
-                "epoch_completed epoch=%s loss=%.6f task_loss=%.6f thinking_loss=%.6f surprise=%.4f "
-                "validation_loss=%s validation_perplexity=%s learning_rate=%.8f optimizer_steps=%s "
+                "epoch_completed epoch=%s loss=%.6f task_loss=%.6f thinking_loss=%.6f answer_loss=%s "
+                "answer_bpb=%s surprise=%.4f validation_loss=%s validation_perplexity=%s "
+                "validation_answer_loss=%s validation_answer_bpb=%s learning_rate=%.8f optimizer_steps=%s "
                 "supervised_tokens=%s tokens=%s expert_activations=%s precision=%s",
                 epoch_index,
                 epoch_metrics.mean_loss,
                 epoch_metrics.mean_task_loss,
                 epoch_metrics.mean_thinking_loss,
+                self.format_metric(answer_loss),
+                self.format_metric(self.to_bits_per_byte(answer_loss)),
                 epoch_metrics.mean_surprise,
                 f"{validation.mean_loss:.6f}" if validation else "none",
                 f"{math.exp(min(validation.mean_loss, 80.0)):.6f}" if validation else "none",
+                self.format_metric(validation_answer_loss),
+                self.format_metric(self.to_bits_per_byte(validation_answer_loss)),
                 optimizer.param_groups[0]["lr"],
                 optimizer_steps,
                 epoch_metrics.supervised_token_count,
@@ -118,11 +133,6 @@ class Trainer:
             )
             accumulator.merge(epoch_metrics)
         elapsed_seconds = time.perf_counter() - start_time
-        final_validation = (
-            self.evaluate(model, validation_loader, settings, device, execution_mode, autocast_dtype)
-            if validation_loader is not None
-            else None
-        )
         return accumulator.to_result(
             elapsed_seconds,
             final_validation,
@@ -144,10 +154,10 @@ class Trainer:
         model.eval()
         with torch.inference_mode():
             for batch in loader:
-                input_ids, target_ids, thinking_mask = self.move_batch(batch, device, settings.pin_memory)
-                supervised_count = int((target_ids != IGNORE_TARGET_ID).sum().item())
-                if supervised_count == 0:
+                supervised_token_count, thinking_token_count = self.count_supervision(batch)
+                if supervised_token_count == 0:
                     continue
+                input_ids, target_ids, thinking_mask = self.move_batch(batch, device, settings.pin_memory)
                 with self.autocast_context(device, autocast_dtype):
                     output = model(input_ids, execution_mode=execution_mode)
                     objective = calculate_training_objective(
@@ -156,8 +166,10 @@ class Trainer:
                         thinking_mask,
                         settings.thinking_loss_weight,
                         settings.label_smoothing,
+                        supervised_token_count=supervised_token_count,
+                        thinking_token_count=thinking_token_count,
                     )
-                metrics.add(output, objective, supervised_count)
+                metrics.add(output, objective, supervised_token_count, thinking_token_count)
         model.train()
         if metrics.supervised_token_count == 0:
             raise ValueError("validation loader produced no supervised tokens")
@@ -200,6 +212,24 @@ class Trainer:
         )
 
     @staticmethod
+    def count_supervision(batch: dict[str, Tensor]) -> tuple[int, int]:
+        target_ids = batch["target_ids"]
+        thinking_mask = batch["thinking_mask"]
+        if target_ids.shape != thinking_mask.shape:
+            raise ValueError("thinking_mask must have the same shape as target_ids")
+        supervised_positions = target_ids != IGNORE_TARGET_ID
+        thinking_positions = supervised_positions & thinking_mask
+        return int(supervised_positions.sum().item()), int(thinking_positions.sum().item())
+
+    @staticmethod
+    def to_bits_per_byte(loss: float | None) -> float | None:
+        return loss / math.log(2.0) if loss is not None else None
+
+    @staticmethod
+    def format_metric(value: float | None) -> str:
+        return f"{value:.6f}" if value is not None else "none"
+
+    @staticmethod
     def learning_rate_factor(step: int, warmup_steps: int, total_steps: int) -> float:
         if warmup_steps > 0 and step < warmup_steps:
             return max(1, step + 1) / warmup_steps
@@ -231,56 +261,119 @@ class Trainer:
 
 class MetricAccumulator:
     def __init__(self) -> None:
-        self.weighted_loss = 0.0
-        self.weighted_task_loss = 0.0
-        self.weighted_thinking_loss = 0.0
-        self.surprise_total = 0.0
+        self.weighted_loss: Tensor | None = None
+        self.weighted_task_loss: Tensor | None = None
+        self.weighted_thinking_loss: Tensor | None = None
+        self.weighted_answer_loss: Tensor | None = None
+        self.surprise_total: Tensor | None = None
+        self.effective_token_weight = 0.0
         self.supervised_token_count = 0
+        self.thinking_token_count = 0
+        self.answer_token_count = 0
         self.token_count = 0
-        self.expert_activation_counts: list[int] = []
+        self.expert_activation_totals: Tensor | None = None
 
-    def add(self, output: KoemiOutput, objective: TrainingObjective, supervised_count: int) -> None:
-        self.weighted_loss += float(objective.total_loss.detach()) * supervised_count
-        self.weighted_task_loss += float(objective.task_loss.detach()) * supervised_count
-        self.weighted_thinking_loss += float(objective.thinking_loss.detach()) * supervised_count
-        self.surprise_total += float(output.surprise_values.masked_select(output.valid_positions).sum().detach())
-        self.supervised_token_count += supervised_count
+    def add(
+        self,
+        output: KoemiOutput,
+        objective: TrainingObjective,
+        supervised_token_count: int,
+        thinking_token_count: int,
+    ) -> None:
+        if objective.answer_loss is None:
+            raise ValueError("training objective must provide answer_loss")
+        if thinking_token_count < 0 or thinking_token_count > supervised_token_count:
+            raise ValueError("thinking token count must be between zero and the supervised token count")
+        answer_token_count = supervised_token_count - thinking_token_count
+        self.weighted_loss = self.add_weighted(
+            self.weighted_loss, objective.total_loss, objective.effective_token_weight
+        )
+        self.weighted_task_loss = self.add_weighted(
+            self.weighted_task_loss, objective.task_loss, supervised_token_count
+        )
+        self.weighted_thinking_loss = self.add_weighted(
+            self.weighted_thinking_loss, objective.thinking_loss, thinking_token_count
+        )
+        self.weighted_answer_loss = self.add_weighted(
+            self.weighted_answer_loss, objective.answer_loss, answer_token_count
+        )
+        surprise_total = output.surprise_values.masked_select(output.valid_positions).sum()
+        self.surprise_total = self.add_tensor(self.surprise_total, surprise_total)
+        self.effective_token_weight += objective.effective_token_weight
+        self.supervised_token_count += supervised_token_count
+        self.thinking_token_count += thinking_token_count
+        self.answer_token_count += answer_token_count
         self.token_count += output.token_count
-        self.accumulate_expert_activations(output.expert_activation_counts)
+        self.accumulate_expert_activations(output)
 
-    def accumulate_expert_activations(self, counts: tuple[int, ...]) -> None:
-        if len(self.expert_activation_counts) < len(counts):
-            self.expert_activation_counts.extend([0] * (len(counts) - len(self.expert_activation_counts)))
-        for index, count in enumerate(counts):
-            self.expert_activation_counts[index] += count
+    @staticmethod
+    def add_tensor(total: Tensor | None, value: Tensor) -> Tensor:
+        value = value.detach()
+        return value if total is None else total + value
+
+    @classmethod
+    def add_weighted(cls, total: Tensor | None, value: Tensor, weight: float) -> Tensor:
+        return cls.add_tensor(total, value * weight)
+
+    def accumulate_expert_activations(self, output: KoemiOutput) -> None:
+        if output.expert_count == 0:
+            return
+        assignments = output.expert_indices.masked_select(output.valid_positions)
+        activation_counts = torch.bincount(assignments, minlength=output.expert_count)
+        self.expert_activation_totals = self.add_tensor(self.expert_activation_totals, activation_counts)
 
     def merge(self, other: MetricAccumulator) -> None:
-        self.weighted_loss += other.weighted_loss
-        self.weighted_task_loss += other.weighted_task_loss
-        self.weighted_thinking_loss += other.weighted_thinking_loss
-        self.surprise_total += other.surprise_total
+        self.weighted_loss = self.merge_tensor(self.weighted_loss, other.weighted_loss)
+        self.weighted_task_loss = self.merge_tensor(self.weighted_task_loss, other.weighted_task_loss)
+        self.weighted_thinking_loss = self.merge_tensor(self.weighted_thinking_loss, other.weighted_thinking_loss)
+        self.weighted_answer_loss = self.merge_tensor(self.weighted_answer_loss, other.weighted_answer_loss)
+        self.surprise_total = self.merge_tensor(self.surprise_total, other.surprise_total)
+        self.expert_activation_totals = self.merge_tensor(
+            self.expert_activation_totals, other.expert_activation_totals
+        )
+        self.effective_token_weight += other.effective_token_weight
         self.supervised_token_count += other.supervised_token_count
+        self.thinking_token_count += other.thinking_token_count
+        self.answer_token_count += other.answer_token_count
         self.token_count += other.token_count
-        self.accumulate_expert_activations(tuple(other.expert_activation_counts))
 
-    def average(self, weighted_value: float) -> float:
-        return weighted_value / self.supervised_token_count if self.supervised_token_count else 0.0
+    @classmethod
+    def merge_tensor(cls, total: Tensor | None, value: Tensor | None) -> Tensor | None:
+        return total if value is None else cls.add_tensor(total, value)
+
+    @staticmethod
+    def average(weighted_value: Tensor | None, token_count: float) -> float:
+        if weighted_value is None or token_count == 0:
+            return 0.0
+        return float((weighted_value / token_count).item())
 
     @property
     def mean_loss(self) -> float:
-        return self.average(self.weighted_loss)
+        return self.average(self.weighted_loss, self.effective_token_weight)
 
     @property
     def mean_task_loss(self) -> float:
-        return self.average(self.weighted_task_loss)
+        return self.average(self.weighted_task_loss, self.supervised_token_count)
 
     @property
     def mean_thinking_loss(self) -> float:
-        return self.average(self.weighted_thinking_loss)
+        return self.average(self.weighted_thinking_loss, self.thinking_token_count)
+
+    @property
+    def mean_answer_loss(self) -> float | None:
+        if self.answer_token_count == 0:
+            return None
+        return self.average(self.weighted_answer_loss, self.answer_token_count)
 
     @property
     def mean_surprise(self) -> float:
-        return self.surprise_total / self.token_count if self.token_count else 0.0
+        return self.average(self.surprise_total, self.token_count)
+
+    @property
+    def expert_activation_counts(self) -> tuple[int, ...]:
+        if self.expert_activation_totals is None:
+            return ()
+        return tuple(int(count) for count in self.expert_activation_totals.tolist())
 
     def to_result(
         self,
@@ -291,6 +384,8 @@ class MetricAccumulator:
         precision: str,
     ) -> TrainingResult:
         validation_loss = validation.mean_loss if validation else None
+        mean_answer_loss = self.mean_answer_loss
+        validation_answer_loss = validation.mean_answer_loss if validation else None
         return TrainingResult(
             self.mean_loss,
             self.mean_task_loss,
@@ -306,4 +401,8 @@ class MetricAccumulator:
             self.supervised_token_count / elapsed_seconds,
             final_learning_rate,
             precision,
+            mean_answer_loss,
+            Trainer.to_bits_per_byte(mean_answer_loss),
+            validation_answer_loss,
+            Trainer.to_bits_per_byte(validation_answer_loss),
         )
