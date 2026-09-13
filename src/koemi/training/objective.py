@@ -15,6 +15,8 @@ class TrainingObjective:
     task_loss: Tensor
     thinking_loss: Tensor
     total_loss: Tensor
+    answer_loss: Tensor | None = None
+    effective_token_weight: float = 0.0
 
 
 def token_cross_entropy(logits: Tensor, target_ids: Tensor, label_smoothing: float = 0.0) -> Tensor:
@@ -34,30 +36,35 @@ def calculate_training_objective(
     thinking_mask: Tensor,
     thinking_loss_weight: float,
     label_smoothing: float = 0.0,
+    *,
+    supervised_token_count: int | None = None,
+    thinking_token_count: int | None = None,
 ) -> TrainingObjective:
     if thinking_loss_weight < 0.0:
         raise ValueError("thinking_loss_weight must be non-negative")
-    supervised_mask = target_ids != IGNORE_TARGET_ID
-    supervised_count = int(supervised_mask.sum())
-    if supervised_count == 0:
-        raise ValueError("training objective requires at least one supervised target token")
     if thinking_mask.shape != target_ids.shape:
         raise ValueError("thinking_mask must have the same shape as target_ids")
-    token_loss = token_cross_entropy(output.logits, target_ids, label_smoothing)
-    task_loss = (token_loss * supervised_mask).sum() / supervised_count
+    if (supervised_token_count is None) != (thinking_token_count is None):
+        raise ValueError("supervised and thinking token counts must be provided together")
+    supervised_mask = target_ids != IGNORE_TARGET_ID
     thinking_positions = supervised_mask & thinking_mask
-    thinking_count = int(thinking_positions.sum())
-    if thinking_count == 0:
-        thinking_loss = token_loss.new_zeros(())
-    else:
-        thinking_loss = (token_loss * thinking_positions).sum() / thinking_count
-    weights = torch.where(
-        thinking_positions,
-        token_loss.new_tensor(thinking_loss_weight),
-        token_loss.new_tensor(1.0),
-    )
-    effective_weight = weights.masked_select(supervised_mask).sum()
-    if float(effective_weight.detach()) <= 0.0:
+    if supervised_token_count is None:
+        supervised_token_count = int(supervised_mask.sum().item())
+        thinking_token_count = int(thinking_positions.sum().item())
+    if supervised_token_count < 1:
+        raise ValueError("training objective requires at least one supervised target token")
+    if thinking_token_count < 0 or thinking_token_count > supervised_token_count:
+        raise ValueError("thinking token count must be between zero and the supervised token count")
+    answer_token_count = supervised_token_count - thinking_token_count
+    token_loss = token_cross_entropy(output.logits, target_ids, label_smoothing)
+    thinking_loss_sum = (token_loss * thinking_positions).sum()
+    answer_positions = supervised_mask & ~thinking_mask
+    answer_loss_sum = (token_loss * answer_positions).sum()
+    task_loss = (thinking_loss_sum + answer_loss_sum) / supervised_token_count
+    thinking_loss = thinking_loss_sum / max(1, thinking_token_count)
+    answer_loss = answer_loss_sum / max(1, answer_token_count)
+    effective_token_weight = answer_token_count + thinking_loss_weight * thinking_token_count
+    if effective_token_weight <= 0.0:
         raise ValueError("thinking_loss_weight removes every supervised target token")
-    total_loss = (token_loss * weights * supervised_mask).sum() / effective_weight
-    return TrainingObjective(task_loss, thinking_loss, total_loss)
+    total_loss = (answer_loss_sum + thinking_loss_weight * thinking_loss_sum) / effective_token_weight
+    return TrainingObjective(task_loss, thinking_loss, total_loss, answer_loss, effective_token_weight)

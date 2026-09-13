@@ -66,11 +66,12 @@ verification.
   --thinking-loss-weight 2.0
 ```
 
-Training logs contain loss, thinking loss, surprise, valid-token count and
-expert activations. Validation loss/perplexity, optimizer steps, learning rate,
-precision and tokens/s are also reported. AdamW, warmup/cosine decay, gradient
-accumulation, label smoothing and AMP are configured through CLI flags. Example
-content is never logged.
+Training logs separate answer loss/BPB from thinking loss, so a trace cannot
+hide a regression in the answer tokens. They also contain loss, surprise,
+valid-token count and expert activations. Validation loss/perplexity, optimizer
+steps, learning rate, precision and tokens/s are reported. AdamW,
+warmup/cosine decay, gradient accumulation, label smoothing and AMP are
+configured through CLI flags. Example content is never logged.
 
 ## Generate
 
